@@ -10,6 +10,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+backend/chroma_db/
 
 # Backend specific
 backend/venv/
