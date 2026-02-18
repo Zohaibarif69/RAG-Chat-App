@@ -82,6 +82,7 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.2.1
 psycopg2-binary==2.9.9
 PyYAML==6.0.3
+sqlalchemy==2.0.32
 referencing==0.37.0
 regex==2026.1.15
 requests==2.32.5

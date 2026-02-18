@@ -3,10 +3,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
+import json
+from typing import Optional, List
 from .vector_store import add_documents, rag_query, get_all_documents, delete_document
+from .database import init_db, create_session, get_session, save_message, get_messages, update_session_documents
+import uuid
 
 # Load environment variables
 load_dotenv()
+
+# Initialize database
+init_db()
 
 # Debug: Check if API key is loaded
 import sys
@@ -30,6 +37,7 @@ app.add_middleware(
 # Pydantic models
 class QueryRequest(BaseModel):
     question: str
+    session_id: str
     top_k: int = 5
 
 
@@ -38,6 +46,93 @@ class QueryResponse(BaseModel):
     answer: str = None
     sources: list = None
     error: str = None
+
+
+class ChatSessionRequest(BaseModel):
+    session_id: Optional[str] = None
+
+
+class ChatSessionResponse(BaseModel):
+    session_id: str
+    created_at: str
+
+
+class MessageResponse(BaseModel):
+    role: str
+    content: str
+    sources: Optional[list] = None
+    created_at: str
+
+
+class ChatHistoryResponse(BaseModel):
+    success: bool
+    messages: List[MessageResponse] = []
+    error: Optional[str] = None
+
+
+# Health check endpoint
+@app.get("/")
+def health_check():
+    return {"status": "yes it is running", "version": "1.0"}
+
+
+# Chat session endpoints
+@app.post("/session", response_model=ChatSessionResponse)
+def create_new_session(request: ChatSessionRequest):
+    """Create a new chat session"""
+    try:
+        session_id = request.session_id or str(uuid.uuid4())
+        existing_session = get_session(session_id)
+        
+        if existing_session:
+            return ChatSessionResponse(
+                session_id=session_id,
+                created_at=existing_session.created_at.isoformat()
+            )
+        
+        session = create_session(session_id)
+        return ChatSessionResponse(
+            session_id=session.id,
+            created_at=session.created_at.isoformat()
+        )
+    except Exception as e:
+        print(f"Error creating session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/session/{session_id}/history", response_model=ChatHistoryResponse)
+def get_chat_history(session_id: str):
+    """Get chat history for a session"""
+    try:
+        messages = get_messages(session_id)
+        return ChatHistoryResponse(
+            success=True,
+            messages=[
+                MessageResponse(
+                    role=msg.role,
+                    content=msg.content,
+                    sources=json.loads(msg.sources) if msg.sources else None,
+                    created_at=msg.created_at.isoformat()
+                )
+                for msg in messages
+            ]
+        )
+    except Exception as e:
+        print(f"Error getting chat history: {e}")
+        return ChatHistoryResponse(
+            success=False,
+            error=str(e)
+        )
+
+
+@app.post("/session/{session_id}/documents")
+def update_session_docs(session_id: str, document_names: str):
+    """Update documents for a session"""
+    try:
+        update_session_documents(session_id, document_names)
+        return {"success": True, "message": "Documents updated"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # Health check endpoint
@@ -74,20 +169,11 @@ def clear_database():
 
 @app.get("/health")
 def health():
-    """Detailed health check"""
-    try:
-        # Try to initialize embedding to see if that's the issue
-        from .vector_store import get_embedding
-        embedding = get_embedding()
-        return {
-            "status": "healthy",
-            "embedding_model": "loaded"
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+    """Simple health check"""
+    return {
+        "status": "healthy",
+        "message": "Backend is running"
+    }
 
 
 # Upload PDF endpoint
@@ -144,14 +230,35 @@ async def upload_pdf(file: UploadFile = File(...)):
         }
 
 
-# RAG Query endpoint
+# RAG Query endpoint with conversation history
 @app.post("/query", response_model=QueryResponse)
 async def query_rag(request: QueryRequest):
-    """Query RAG system and get answer with sources"""
+    """Query RAG system with multi-turn conversation support"""
     try:
-        result = rag_query(request.question, request.top_k)
+        # Get conversation history (last 5 messages)
+        history = get_messages(request.session_id, limit=10)
+        
+        # Build conversation context
+        conversation_context = ""
+        if history:
+            conversation_context = "\n\nPrevious conversation:\n"
+            for msg in history[-5:]:  # Last 5 messages for context
+                role = "User" if msg.role == "user" else "Assistant"
+                conversation_context += f"{role}: {msg.content}\n"
+        
+        # Add question with context
+        full_question = request.question
+        if conversation_context:
+            full_question = f"{conversation_context}\nUser: {request.question}"
+        
+        # Get RAG answer
+        result = rag_query(full_question, request.top_k)
         
         if result["success"]:
+            # Save messages to database
+            save_message(request.session_id, "user", request.question)
+            save_message(request.session_id, "assistant", result["answer"], json.dumps(result.get("sources", [])))
+            
             return QueryResponse(
                 success=True,
                 answer=result["answer"],
@@ -164,6 +271,9 @@ async def query_rag(request: QueryRequest):
             )
             
     except Exception as e:
+        print(f"Error in query: {e}")
+        import traceback
+        traceback.print_exc()
         return QueryResponse(
             success=False,
             error=str(e)
