@@ -6,8 +6,10 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 import PyPDF2
 from io import BytesIO
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import os
+from rank_bm25 import BM25Okapi
+import numpy as np
 
 # Lazy-initialized globals
 _embedding = None
@@ -100,6 +102,163 @@ def chunk_documents(text: str, metadata: Dict) -> List[Document]:
     return documents
 
 
+def normalize_scores(scores: List[float]) -> List[float]:
+    """Normalize scores to 0-1 range using min-max normalization"""
+    if not scores or len(scores) == 0:
+        return []
+    
+    min_score = min(scores)
+    max_score = max(scores)
+    
+    if min_score == max_score:
+        return [1.0] * len(scores)
+    
+    return [(score - min_score) / (max_score - min_score) for score in scores]
+
+
+def hybrid_retrieve(query: str, k: int = 5, alpha: float = 0.6) -> Tuple[List[Document], List[Dict]]:
+    """
+    Hybrid retrieval combining BM25 (keyword) and vector similarity search.
+    
+    Args:
+        query: Search query
+        k: Number of results to return
+        alpha: Weight for vector similarity (0-1). Result = alpha*vec + (1-alpha)*bm25
+               alpha=0.6 gives 60% to semantic, 40% to keyword matching
+    
+    Returns:
+        Tuple of (documents, sources with relevance scores)
+    """
+    try:
+        vectorstore = get_chroma_vectorstore()
+        collection = vectorstore._collection
+        
+        # Get all documents from collection
+        all_data = collection.get()
+        if not all_data or not all_data.get('ids'):
+            return [], []
+        
+        all_docs = all_data.get('documents', [])
+        all_ids = all_data.get('ids', [])
+        all_metadatas = all_data.get('metadatas', [])
+        
+        # --- VECTOR SIMILARITY SEARCH ---
+        # Get vector similarity scores (retrieve from all docs, map by content)
+        vector_results = vectorstore.similarity_search_with_score(query, k=min(k*3, len(all_docs)))
+        
+        # Create mapping of document content to vector scores
+        vector_content_scores = {}
+        for doc, score in vector_results:
+            content = doc.page_content
+            if content not in vector_content_scores:  # Keep highest score
+                vector_content_scores[content] = float(score)
+        
+        # --- BM25 KEYWORD SEARCH ---
+        # Tokenize all documents
+        tokenized_docs = [doc.lower().split() for doc in all_docs]
+        bm25 = BM25Okapi(tokenized_docs)
+        
+        # Get BM25 scores for query
+        query_tokens = query.lower().split()
+        bm25_scores_raw = bm25.get_scores(query_tokens)
+        
+        # Create BM25 mapping by document index
+        bm25_scores_dict = {i: float(score) for i, score in enumerate(bm25_scores_raw)}
+        
+        # --- NORMALIZE BOTH SCORE SETS ---
+        # Get all vector scores for normalization
+        all_vector_scores = []
+        for i, doc_content in enumerate(all_docs):
+            if doc_content in vector_content_scores:
+                all_vector_scores.append(vector_content_scores[doc_content])
+        
+        # Normalize vector scores
+        normalized_vector_dict = {}
+        if all_vector_scores:
+            norm_vector_scores = normalize_scores(all_vector_scores)
+            score_idx = 0
+            for i, doc_content in enumerate(all_docs):
+                if doc_content in vector_content_scores:
+                    normalized_vector_dict[i] = norm_vector_scores[score_idx]
+                    score_idx += 1
+                else:
+                    normalized_vector_dict[i] = 0.0
+        else:
+            normalized_vector_dict = {i: 0.0 for i in range(len(all_docs))}
+        
+        # Normalize BM25 scores
+        bm25_values = list(bm25_scores_dict.values())
+        if bm25_values and max(bm25_values) > 0:
+            normalized_bm25 = normalize_scores(bm25_values)
+            normalized_bm25_dict = {i: normalized_bm25[i] for i in range(len(all_docs))}
+        else:
+            normalized_bm25_dict = {i: 0.0 for i in range(len(all_docs))}
+        
+        # --- MERGE RESULTS WITH WEIGHTED COMBINATION ---
+        # Combined score = (alpha * vector) + ((1-alpha) * bm25)
+        combined_scores = {}
+        for idx in range(len(all_docs)):
+            vec_score = normalized_vector_dict.get(idx, 0.0)
+            bm25_score = normalized_bm25_dict.get(idx, 0.0)
+            combined = (alpha * vec_score) + ((1 - alpha) * bm25_score)
+            combined_scores[idx] = {
+                'combined': combined,
+                'vector': vec_score,
+                'bm25': bm25_score
+            }
+        
+        # Sort by combined score and get top k
+        sorted_indices = sorted(combined_scores.keys(), 
+                               key=lambda x: combined_scores[x]['combined'], 
+                               reverse=True)[:k]
+        
+        # Build final results
+        documents = []
+        sources = []
+        for idx in sorted_indices:
+            doc_content = all_docs[idx]
+            metadata = all_metadatas[idx]
+            doc = Document(page_content=doc_content, metadata=metadata)
+            documents.append(doc)
+            
+            scores = combined_scores[idx]
+            sources.append({
+                "source": metadata.get("source", "Unknown"),
+                "chunk": metadata.get("chunk", 0),
+                "relevance": round(scores['combined'], 3),
+                "vector_score": round(scores['vector'], 3),
+                "bm25_score": round(scores['bm25'], 3),
+                "method": "hybrid"
+            })
+        
+        return documents, sources
+    
+    except Exception as e:
+        print(f"Error in hybrid_retrieve: {e}")
+        import traceback
+        traceback.print_exc()
+        return retrieve_context_vector_only(query, k)
+
+
+def retrieve_context_vector_only(query: str, k: int = 5) -> Tuple[List[Document], List[Dict]]:
+    """Pure vector similarity search (fallback)"""
+    results = get_chroma_vectorstore().similarity_search_with_score(query, k=k)
+    
+    documents = []
+    sources = []
+    
+    for doc, score in results:
+        documents.append(doc)
+        sources.append({
+            "source": doc.metadata.get("source", "Unknown"),
+            "chunk": doc.metadata.get("chunk", 0),
+            "relevance": float(score),
+            "method": "vector_only"
+        })
+    
+    return documents, sources
+
+
 def add_documents(pdf_bytes: bytes, filename: str) -> Dict:
     """Process and add PDF documents to vector store"""
     try:
@@ -190,22 +349,24 @@ def add_documents(pdf_bytes: bytes, filename: str) -> Dict:
         }
 
 
-def retrieve_context(query: str, k: int = 5) -> tuple[List[Document], List[Dict]]:
-    """Retrieve top k relevant documents"""
-    results = get_chroma_vectorstore().similarity_search_with_score(query, k=k)
+def retrieve_context(query: str, k: int = 5, use_hybrid: bool = True, filters: Dict = None, alpha: float = 0.6) -> tuple[List[Document], List[Dict]]:
+    """
+    Retrieve top k relevant documents using hybrid search with optional metadata filtering.
     
-    documents = []
-    sources = []
+    Args:
+        query: Search query
+        k: Number of results to return
+        use_hybrid: Use hybrid retrieval (BM25 + vector) vs vector-only
+        filters: Optional metadata filters (e.g., {"year": "2024", "category": "finance"})
+        alpha: Weight for vector similarity (0.6 = 60% vector, 40% BM25)
     
-    for doc, score in results:
-        documents.append(doc)
-        sources.append({
-            "source": doc.metadata.get("source", "Unknown"),
-            "chunk": doc.metadata.get("chunk", 0),
-            "relevance": float(score)
-        })
-    
-    return documents, sources
+    Returns:
+        Tuple of (documents, sources with relevance scores)
+    """
+    if use_hybrid:
+        return hybrid_retrieve(query, k, alpha)
+    else:
+        return retrieve_context_vector_only(query, k)
 
 
 def generate_answer(query: str, context_docs: List[Document]) -> tuple[str, List[Dict]]:
