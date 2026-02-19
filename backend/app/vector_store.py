@@ -10,6 +10,8 @@ from typing import List, Dict, Tuple
 import os
 from rank_bm25 import BM25Okapi
 import numpy as np
+import json
+from datetime import datetime
 
 # Lazy-initialized globals
 _embedding = None
@@ -558,6 +560,260 @@ def multi_query_retrieve(query: str, k: int = 5, use_query_rewriting: bool = Tru
         return hybrid_retrieve(query, k)
 
 
+def decompose_question_into_hops(question: str) -> List[Dict]:
+    """
+    Decompose a complex question into sequential reasoning hops.
+    Each hop represents a step in the reasoning chain.
+    
+    Args:
+        question: The original complex question
+    
+    Returns:
+        List of hops with type, query, and purpose
+    """
+    try:
+        llm = get_llm()
+        
+        prompt_template = PromptTemplate(
+            input_variables=["question"],
+            template="""You are an expert at breaking down complex questions into reasoning steps.
+
+Question: {question}
+
+Analyze this question and decompose it into sequential retrieval steps.
+Each step should retrieve specific information needed to answer the question.
+
+For example:
+- Question: "Which product launched after the CEO change?"
+  Steps:
+  1. Find: When did the current CEO take office? (retrieve CEO information)
+  2. Find: What products launched after that date? (retrieve product launches)
+  3. Compare: Filter products by launch date
+
+Output format: Return ONLY a JSON array of objects with:
+{{"order": step_number, "type": "retrieve|extract|compare|synthesize", "query": "what to retrieve", "purpose": "why this step"}}
+
+Examples of types:
+- retrieve: Get documents/context about a topic
+- extract: Find specific entities or facts from retrieved data
+- compare: Compare or filter based on conditions
+- synthesize: Combine information to answer
+
+Generate the decomposition:"""
+        )
+        
+        prompt = prompt_template.format(question=question)
+        response = llm.invoke(prompt)
+        
+        # Parse JSON response
+        response_text = response.content
+        
+        # Extract JSON array from response
+        import re
+        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if json_match:
+            hops = json.loads(json_match.group())
+            
+            print(f"📋 Decomposed into {len(hops)} reasoning hops:")
+            for hop in hops:
+                print(f"  Step {hop.get('order', '?')}: [{hop.get('type', '?').upper()}] {hop.get('query', '?')}")
+            
+            return hops
+        else:
+            print("Could not parse hop decomposition, using single-hop retrieval")
+            return [{"order": 1, "type": "retrieve", "query": question, "purpose": "Answer the question"}]
+    
+    except Exception as e:
+        print(f"Error decomposing question: {e}")
+        # Fallback to single hop
+        return [{"order": 1, "type": "retrieve", "query": question, "purpose": "Answer the question"}]
+
+
+def extract_entities_from_context(context: str, extraction_prompt: str) -> Dict:
+    """
+    Extract relevant entities and facts from context using LLM.
+    
+    Args:
+        context: The text to extract from
+        extraction_prompt: What entities to extract
+    
+    Returns:
+        Dictionary of extracted entities
+    """
+    try:
+        llm = get_llm()
+        
+        prompt_template = PromptTemplate(
+            input_variables=["context", "extraction_prompt"],
+            template="""From the following context, extract the requested information:
+
+Context:
+{context}
+
+Task: {extraction_prompt}
+
+Extract and return ONLY a JSON object with the extracted information.
+Format: {{"entity_name": "value", "date": "value", ...}}
+If information is not found, omit that field.
+
+Extraction result:"""
+        )
+        
+        prompt = prompt_template.format(context=context, extraction_prompt=extraction_prompt)
+        response = llm.invoke(prompt)
+        
+        # Parse JSON response
+        response_text = response.content
+        import re
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            extracted = json.loads(json_match.group())
+            print(f"   ✓ Extracted entities: {extracted}")
+            return extracted
+        
+        return {}
+    
+    except Exception as e:
+        print(f"Error extracting entities: {e}")
+        return {}
+
+
+def multi_hop_retrieve(question: str, k: int = 5, max_hops: int = 4) -> tuple[List[Document], List[Dict]]:
+    """
+    Advanced multi-hop retrieval for complex reasoning questions.
+    Breaks down complex questions, retrieves info sequentially, and synthesizes answers.
+    
+    Args:
+        question: Complex question requiring multi-step reasoning
+        k: Documents to retrieve per hop
+        max_hops: Maximum reasoning steps to perform
+    
+    Returns:
+        Tuple of (documents, sources with reasoning path)
+    """
+    try:
+        print(f"\n🔗 MULTI-HOP RETRIEVAL")
+        print(f"Question: {question}")
+        print("-" * 70)
+        
+        # Step 1: Decompose question into hops
+        hops = decompose_question_into_hops(question)
+        hops = hops[:max_hops]  # Limit hops
+        
+        # Track reasoning across hops
+        hop_results = []
+        accumulated_context = ""
+        all_retrieved_docs = []
+        processed_entities = {}
+        
+        # Step 2: Execute each hop sequentially
+        for hop in hops:
+            hop_num = hop.get("order", 1)
+            hop_type = hop.get("type", "retrieve")
+            hop_query = hop.get("query", "")
+            hop_purpose = hop.get("purpose", "")
+            
+            print(f"\n🔄 HOP {hop_num}/{len(hops)}: {hop_type.upper()}")
+            print(f"   Purpose: {hop_purpose}")
+            print(f"   Query: {hop_query}")
+            
+            if hop_type == "retrieve":
+                # Retrieve documents for this hop
+                docs, sources = multi_query_retrieve(hop_query, k=k)
+                
+                if docs:
+                    print(f"   ✓ Retrieved {len(docs)} documents")
+                    all_retrieved_docs.extend(docs)
+                    
+                    # Summarize retrieved info
+                    context_text = "\n".join([doc.page_content[:200] for doc in docs])
+                    accumulated_context += f"\n\n[Hop {hop_num} - {hop_purpose}]:\n{context_text}"
+                    
+                    hop_results.append({
+                        "hop": hop_num,
+                        "type": hop_type,
+                        "query": hop_query,
+                        "found_documents": len(docs),
+                        "sources": sources,
+                        "status": "success"
+                    })
+                else:
+                    print(f"   ⚠ No documents found")
+                    hop_results.append({
+                        "hop": hop_num,
+                        "type": hop_type,
+                        "query": hop_query,
+                        "found_documents": 0,
+                        "status": "no_results"
+                    })
+            
+            elif hop_type == "extract":
+                # Extract entities from accumulated context
+                extraction_task = hop_query
+                extracted = extract_entities_from_context(accumulated_context, extraction_task)
+                processed_entities.update(extracted)
+                
+                hop_results.append({
+                    "hop": hop_num,
+                    "type": hop_type,
+                    "task": hop_query,
+                    "extracted": extracted,
+                    "status": "success"
+                })
+            
+            elif hop_type == "compare":
+                # Use extracted entities to filter/compare
+                print(f"   📊 Comparing with extracted entities: {processed_entities}")
+                hop_results.append({
+                    "hop": hop_num,
+                    "type": hop_type,
+                    "task": hop_query,
+                    "used_entities": processed_entities,
+                    "status": "executed"
+                })
+            
+            elif hop_type == "synthesize":
+                # Mark as ready for synthesis
+                print(f"   🎯 Ready to synthesize answer")
+                hop_results.append({
+                    "hop": hop_num,
+                    "type": hop_type,
+                    "status": "prepared"
+                })
+        
+        # Step 3: Deduplicate and rank documents
+        seen_content = set()
+        unique_docs = []
+        unique_sources = []
+        
+        for doc in all_retrieved_docs:
+            content = doc.page_content
+            if content not in seen_content:
+                seen_content.add(content)
+                unique_docs.append(doc)
+        
+        print(f"\n✓ Multi-hop retrieval complete: {len(unique_docs)} documents across {len(hops)} hops")
+        
+        # Return with reasoning path metadata
+        for doc in unique_docs:
+            unique_sources.append({
+                "source": doc.metadata.get("source", "Unknown"),
+                "chunk": doc.metadata.get("chunk", 0),
+                "relevance": 1.0,
+                "method": "multi_hop",
+                "reasoning_path": hop_results
+            })
+        
+        return unique_docs[:k], unique_sources[:k]
+    
+    except Exception as e:
+        print(f"Error in multi_hop_retrieve: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback to multi-query retrieval
+        return multi_query_retrieve(question, k)
+
+
 def generate_answer(query: str, context_docs: List[Document]) -> tuple[str, List[Dict]]:
     """Generate answer using Groq LLM with retrieved context"""
     
@@ -587,21 +843,73 @@ Answer: """
     return answer.content
 
 
-def rag_query(query: str, k: int = 5, use_query_rewriting: bool = True) -> Dict:
+def detect_complex_query(question: str) -> bool:
     """
-    Complete RAG pipeline with optional query rewriting for smarter retrieval.
+    Detect if a question requires multi-hop reasoning.
+    
+    Indicators of complex queries:
+    - Multiple entities or relationships
+    - "After", "before", "between" (temporal reasoning)
+    - "Which", "how many" (filtering/comparison)
+    - "Why", "how" (causal reasoning)
+    - Multiple clauses
+    
+    Args:
+        question: The user's question
+    
+    Returns:
+        True if question appears to need multi-hop reasoning
+    """
+    complex_indicators = [
+        "after", "before", "between", "during",  # Temporal
+        "which", "who", "where",  # Specific entity queries
+        "how many", "how much",  # Aggregation
+        "relate", "connection", "caused",  # Relationships
+        "compare", "versus", "vs",  # Comparison
+        "both", "and",  # Multiple conditions
+        "first", "then", "next",  # Sequential
+    ]
+    
+    question_lower = question.lower()
+    
+    # Check for complex indicators
+    has_complex_marker = any(marker in question_lower for marker in complex_indicators)
+    
+    # Check for multiple clauses
+    has_multiple_clauses = question_lower.count("?") > 1 or (
+        "," in question and question_lower.count("and") > 1
+    )
+    
+    # High complexity = multiple reasoning steps
+    return has_complex_marker and len(question) > 50 or has_multiple_clauses
+
+
+def rag_query(query: str, k: int = 5, use_query_rewriting: bool = True, use_multi_hop: bool = True) -> Dict:
+    """
+    Complete RAG pipeline with multi-hop support for complex reasoning.
     
     Args:
         query: User's question
         k: Number of documents to retrieve
-        use_query_rewriting: Enable query rewriting for better coverage (default True)
+        use_query_rewriting: Enable query rewriting for vague queries
+        use_multi_hop: Enable multi-hop reasoning for complex questions
     
     Returns:
         Dictionary with success status, answer, and sources
     """
     try:
-        # Retrieve relevant documents (with optional query rewriting)
-        if use_query_rewriting:
+        # Check if question needs multi-hop reasoning
+        is_complex = detect_complex_query(query) and use_multi_hop
+        
+        print(f"\n{'🔗 MULTI-HOP' if is_complex else '🔍 STANDARD'} RAG QUERY")
+        print(f"Question: {query}")
+        print(f"Complex reasoning needed: {is_complex}")
+        print("-" * 70)
+        
+        # Retrieve relevant documents
+        if is_complex:
+            context_docs, sources = multi_hop_retrieve(query, k)
+        elif use_query_rewriting:
             context_docs, sources = multi_query_retrieve(query, k)
         else:
             context_docs, sources = hybrid_retrieve(query, k)
@@ -618,7 +926,8 @@ def rag_query(query: str, k: int = 5, use_query_rewriting: bool = True) -> Dict:
         return {
             "success": True,
             "answer": answer,
-            "sources": sources
+            "sources": sources,
+            "reasoning_method": "multi_hop" if is_complex else ("multi_query" if use_query_rewriting else "hybrid")
         }
     except Exception as e:
         print(f"Error in rag_query: {e}")
@@ -628,6 +937,9 @@ def rag_query(query: str, k: int = 5, use_query_rewriting: bool = True) -> Dict:
             "success": False,
             "error": str(e)
         }
+
+
+
 
 
 def get_all_documents() -> List[Dict]:
