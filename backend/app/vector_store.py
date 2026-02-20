@@ -814,6 +814,294 @@ def multi_hop_retrieve(question: str, k: int = 5, max_hops: int = 4) -> tuple[Li
         return multi_query_retrieve(question, k)
 
 
+def verify_answer_with_sources(answer: str, context_docs: List[Document], original_question: str) -> Dict:
+    """
+    Verify if the generated answer is fully supported by the provided sources.
+    This is a self-check mechanism to reduce hallucination.
+    
+    Args:
+        answer: The generated answer to verify
+        context_docs: List of source documents used for generation
+        original_question: The original user question
+    
+    Returns:
+        Dictionary with verification result, confidence score, and unsupported claims
+    """
+    try:
+        llm = get_llm()
+        
+        # Prepare source text
+        sources_text = "\n\n".join([
+            f"[Source {i+1}] {doc.metadata.get('source', 'Unknown')}:\n{doc.page_content[:500]}"
+            for i, doc in enumerate(context_docs)
+        ])
+        
+        verification_prompt = PromptTemplate(
+            input_variables=["answer", "sources", "question"],
+            template="""You are a careful fact-checker. Your job is to verify if an answer is fully supported by provided sources.
+
+QUESTION: {question}
+
+ANSWER TO VERIFY:
+{answer}
+
+PROVIDED SOURCES:
+{sources}
+
+VERIFICATION TASK:
+1. Check if each claim in the answer is supported by the sources
+2. Identify any claims that are NOT explicitly mentioned in sources
+3. Assess overall confidence that answer is accurate based on sources
+4. Flag any potential hallucinations or unsupported inferences
+
+Provide response in JSON format:
+{{
+  "is_fully_supported": true/false,
+  "confidence": 0.0-1.0,
+  "supported_claims": ["claim 1", "claim 2"],
+  "unsupported_claims": ["claim 3"],
+  "hallucination_risk": "low/medium/high",
+  "explanation": "brief explanation",
+  "recommendation": "accept/regenerate/flag"
+}}
+
+Verification result:"""
+        )
+        
+        prompt = verification_prompt.format(
+            answer=answer,
+            sources=sources_text,
+            question=original_question
+        )
+        
+        response = llm.invoke(prompt)
+        response_text = response.content
+        
+        # Extract JSON from response
+        import re
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+            
+            print(f"\n✓ Answer Verification Complete:")
+            print(f"  - Fully Supported: {result.get('is_fully_supported', False)}")
+            print(f"  - Confidence: {result.get('confidence', 0.0):.2%}")
+            print(f"  - Hallucination Risk: {result.get('hallucination_risk', 'unknown')}")
+            print(f"  - Recommendation: {result.get('recommendation', 'unknown')}")
+            
+            if result.get('unsupported_claims'):
+                print(f"  - Unsupported Claims: {result['unsupported_claims']}")
+            
+            return result
+        else:
+            print("Could not parse verification result")
+            return {
+                "is_fully_supported": True,
+                "confidence": 0.5,
+                "hallucination_risk": "unknown",
+                "recommendation": "accept",
+                "explanation": "Could not perform verification"
+            }
+    
+    except Exception as e:
+        print(f"Error in answer verification: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return neutral result on error
+        return {
+            "is_fully_supported": True,
+            "confidence": 0.5,
+            "hallucination_risk": "medium",
+            "recommendation": "accept",
+            "explanation": f"Verification failed: {str(e)}"
+        }
+
+
+def regenerate_answer(query: str, context_docs: List[Document], attempt: int = 1) -> str:
+    """
+    Regenerate answer with alternative prompt strategy.
+    Used when initial answer fails verification.
+    
+    Args:
+        query: The user's question
+        context_docs: Source documents
+        attempt: Which regeneration attempt (affects prompt style)
+    
+    Returns:
+        Regenerated answer string
+    """
+    try:
+        llm = get_llm()
+        
+        # Prepare context
+        context_text = "\n\n".join([
+            f"Source: {doc.metadata.get('source', 'Unknown')}\n{doc.page_content}"
+            for doc in context_docs
+        ])
+        
+        # Different prompt strategies for different attempts
+        if attempt == 1:
+            # Conservative strategy - only use explicit information
+            template = """You are a careful, conservative assistant. Only use information explicitly stated in the context.
+Do not make inferences or assumptions. If information is not in the context, say "This is not mentioned in the provided sources."
+
+Context:
+{context}
+
+Question: {question}
+
+Answer (only from explicit context):"""
+        
+        elif attempt == 2:
+            # Structured strategy - break down the answer
+            template = """You are a structured analyst. Answer the question by:
+1. First listing what information IS available in the sources
+2. Then answering with only that information
+3. Clearly marking any gaps
+
+Context:
+{context}
+
+Question: {question}
+
+Structured answer:"""
+        
+        else:
+            # Citation strategy - cite sources for each claim
+            template = """You are a meticulous assistant. Answer the question and cite which source supports each claim.
+Format: "Claim [source reference]"
+
+Context:
+{context}
+
+Question: {question}
+
+Answer with citations:"""
+        
+        prompt_template = PromptTemplate(
+            input_variables=["context", "question"],
+            template=template
+        )
+        
+        prompt = prompt_template.format(context=context_text, question=query)
+        response = llm.invoke(prompt)
+        
+        print(f"\n🔄 Regenerated answer (attempt {attempt}):")
+        return response.content
+    
+    except Exception as e:
+        print(f"Error regenerating answer: {e}")
+        return f"Error regenerating answer: {str(e)}"
+
+
+def generate_answer_with_reflection(query: str, context_docs: List[Document], max_regeneration_attempts: int = 2) -> tuple[str, Dict]:
+    """
+    Generate answer with reflection/self-check to reduce hallucination.
+    
+    Process:
+    1. Generate initial answer
+    2. Verify answer against sources
+    3. If not well-supported, regenerate with different strategy
+    4. Return answer with verification metadata
+    
+    Args:
+        query: User's question
+        context_docs: Source documents
+        max_regeneration_attempts: Max attempts to improve answer
+    
+    Returns:
+        Tuple of (final_answer, verification_metadata)
+    """
+    try:
+        print(f"\n" + "=" * 70)
+        print(f"ANSWER GENERATION WITH REFLECTION")
+        print(f"=" * 70)
+        
+        # Step 1: Generate initial answer
+        print(f"\n1️⃣  GENERATING INITIAL ANSWER...")
+        initial_answer = generate_answer(query, context_docs)
+        print(f"✓ Initial answer generated")
+        
+        # Step 2: Verify answer
+        print(f"\n2️⃣  VERIFYING ANSWER AGAINST SOURCES...")
+        verification = verify_answer_with_sources(initial_answer, context_docs, query)
+        
+        # Step 3: Check if answer needs regeneration
+        is_supported = verification.get("is_fully_supported", True)
+        confidence = verification.get("confidence", 0.5)
+        recommendation = verification.get("recommendation", "accept")
+        
+        final_answer = initial_answer
+        final_verification = verification
+        regeneration_count = 0
+        
+        # Regenerate if confidence is low or explicitly recommended
+        if not is_supported or recommendation == "regenerate" or confidence < 0.6:
+            print(f"\n3️⃣  ANSWER NEEDS IMPROVEMENT (confidence: {confidence:.0%})")
+            print(f"   Reason: {verification.get('explanation', 'Low confidence')}")
+            
+            # Try up to max_regeneration_attempts
+            for attempt in range(1, max_regeneration_attempts + 1):
+                print(f"\n   Attempt {attempt}/{max_regeneration_attempts}...")
+                
+                # Regenerate with different strategy
+                regenerated = regenerate_answer(query, context_docs, attempt=attempt)
+                
+                # Verify regenerated answer
+                new_verification = verify_answer_with_sources(regenerated, context_docs, query)
+                new_confidence = new_verification.get("confidence", 0.5)
+                
+                print(f"   New confidence: {new_confidence:.0%}")
+                
+                # Use if better
+                if new_confidence > confidence or new_verification.get("is_fully_supported", False):
+                    final_answer = regenerated
+                    final_verification = new_verification
+                    confidence = new_confidence
+                    regeneration_count = attempt
+                    print(f"   ✓ Improved answer accepted")
+                    
+                    if new_verification.get("is_fully_supported"):
+                        print(f"   ✓ Answer is now fully supported")
+                        break
+        else:
+            print(f"\n3️⃣  ANSWER VERIFICATION PASSED")
+            print(f"   Answer is well-supported by sources (confidence: {confidence:.0%})")
+        
+        # Step 4: Prepare final metadata
+        final_metadata = {
+            "verified": final_verification.get("is_fully_supported", True),
+            "confidence": final_verification.get("confidence", 0.5),
+            "hallucination_risk": final_verification.get("hallucination_risk", "unknown"),
+            "verification_details": final_verification,
+            "regeneration_attempts": regeneration_count,
+            "unsupported_claims": final_verification.get("unsupported_claims", []),
+            "reflection_performed": True
+        }
+        
+        print(f"\n✅ FINAL ANSWER READY")
+        print(f"   Verification: {final_verification.get('is_fully_supported', False)}")
+        print(f"   Confidence: {final_metadata['confidence']:.0%}")
+        print(f"   Regenerations: {regeneration_count}")
+        
+        return final_answer, final_metadata
+    
+    except Exception as e:
+        print(f"Error in answer generation with reflection: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Fallback to simple generation
+        basic_answer = generate_answer(query, context_docs)
+        return basic_answer, {
+            "verified": False,
+            "confidence": 0.3,
+            "hallucination_risk": "high",
+            "reflection_performed": False,
+            "error": str(e)
+        }
+
+
 def generate_answer(query: str, context_docs: List[Document]) -> tuple[str, List[Dict]]:
     """Generate answer using Groq LLM with retrieved context"""
     
@@ -843,48 +1131,105 @@ Answer: """
     return answer.content
 
 
-def detect_complex_query(question: str) -> bool:
+def detect_complex_query(query: str) -> bool:
+    """Detect whether a query likely needs multi-hop reasoning."""
+    if not query or not query.strip():
+        return False
+
+    text = query.lower().strip()
+
+    # Heuristic 1: multi-step reasoning keywords
+    complexity_keywords = [
+        "compare",
+        "difference",
+        "versus",
+        "after",
+        "before",
+        "between",
+        "based on",
+        "why",
+        "how did",
+        "cause",
+        "impact",
+        "timeline",
+        "sequence",
+        "relationship",
+        "correlation",
+        "which one",
+    ]
+
+    keyword_hits = sum(1 for keyword in complexity_keywords if keyword in text)
+
+    # Heuristic 2: long questions with conjunctions usually imply multiple constraints
+    conjunctions = [" and ", " or ", " then ", " while ", " but "]
+    conjunction_hits = sum(1 for conjunction in conjunctions if conjunction in text)
+
+    # Heuristic 3: explicit multi-part question markers
+    is_multi_part = text.count("?") > 1 or text.count(",") >= 2
+
+    return keyword_hits >= 1 or conjunction_hits >= 2 or is_multi_part
+
+
+def rag_query(query: str, k: int = 5, use_query_rewriting: bool = True, use_multi_hop: bool = True, use_reflection: bool = True) -> Dict:
     """
-    Detect if a question requires multi-hop reasoning.
-    
-    Indicators of complex queries:
-    - Multiple entities or relationships
-    - "After", "before", "between" (temporal reasoning)
-    - "Which", "how many" (filtering/comparison)
-    - "Why", "how" (causal reasoning)
-    - Multiple clauses
+    Complete RAG pipeline with reflection/self-check to reduce hallucination.
     
     Args:
-        question: The user's question
+        query: User's question
+        k: Number of documents to retrieve
+        use_query_rewriting: Enable query rewriting for vague queries
+        use_multi_hop: Enable multi-hop reasoning for complex questions
+        use_reflection: Enable reflection/self-check for answer verification
     
     Returns:
-        True if question appears to need multi-hop reasoning
+        Dictionary with success status, answer, sources, and verification metadata
     """
-    complex_indicators = [
-        "after", "before", "between", "during",  # Temporal
-        "which", "who", "where",  # Specific entity queries
-        "how many", "how much",  # Aggregation
-        "relate", "connection", "caused",  # Relationships
-        "compare", "versus", "vs",  # Comparison
-        "both", "and",  # Multiple conditions
-        "first", "then", "next",  # Sequential
-    ]
-    
-    question_lower = question.lower()
-    
-    # Check for complex indicators
-    has_complex_marker = any(marker in question_lower for marker in complex_indicators)
-    
-    # Check for multiple clauses
-    has_multiple_clauses = question_lower.count("?") > 1 or (
-        "," in question and question_lower.count("and") > 1
-    )
-    
-    # High complexity = multiple reasoning steps
-    return has_complex_marker and len(question) > 50 or has_multiple_clauses
-
-
-def rag_query(query: str, k: int = 5, use_query_rewriting: bool = True, use_multi_hop: bool = True) -> Dict:
+    try:
+        # Check if question needs multi-hop reasoning
+        is_complex = detect_complex_query(query) and use_multi_hop
+        
+        print(f"\n{'🔗 MULTI-HOP' if is_complex else '🔍 STANDARD'} RAG QUERY")
+        print(f"Question: {query}")
+        print(f"Complex reasoning: {is_complex}")
+        print(f"Reflection enabled: {use_reflection}")
+        print("-" * 70)
+        
+        # Retrieve relevant documents
+        if is_complex:
+            context_docs, sources = multi_hop_retrieve(query, k)
+        elif use_query_rewriting:
+            context_docs, sources = multi_query_retrieve(query, k)
+        else:
+            context_docs, sources = hybrid_retrieve(query, k)
+        
+        if not context_docs:
+            return {
+                "success": False,
+                "error": "No relevant documents found"
+            }
+        
+        # Generate answer (with optional reflection/self-check)
+        if use_reflection:
+            answer, reflection_metadata = generate_answer_with_reflection(query, context_docs)
+        else:
+            answer = generate_answer(query, context_docs)
+            reflection_metadata = {"reflection_performed": False}
+        
+        return {
+            "success": True,
+            "answer": answer,
+            "sources": sources,
+            "reasoning_method": "multi_hop" if is_complex else ("multi_query" if use_query_rewriting else "hybrid"),
+            "reflection": reflection_metadata
+        }
+    except Exception as e:
+        print(f"Error in rag_query: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e)
+        }
     """
     Complete RAG pipeline with multi-hop support for complex reasoning.
     
