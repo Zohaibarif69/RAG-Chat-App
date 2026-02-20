@@ -1,14 +1,16 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 import json
-from typing import Optional, List
+from typing import Optional, List, AsyncGenerator
 from .vector_store import add_documents, rag_query, get_all_documents, delete_document
 from .database import init_db, create_session, get_session, save_message, get_messages, update_session_documents
 from .evaluation import get_evaluator, QueryMetricsTracker
 import uuid
+import asyncio
 
 # Load environment variables
 load_dotenv()
@@ -338,6 +340,138 @@ def delete_doc(source_name: str):
             "success": False,
             "error": str(e)
         }
+
+
+# Streaming Query endpoint with token-level streaming
+@app.post("/query/stream")
+async def query_rag_stream(request: QueryRequest):
+    """
+    Stream RAG query response token-by-token.
+    Useful for real-time UI updates with sources and confidence.
+    """
+    try:
+        evaluator = get_evaluator()
+        metrics_tracker = QueryMetricsTracker(request.question, evaluator)
+        
+        # Get conversation history
+        metrics_tracker.start_phase("conversation_history")
+        history = get_messages(request.session_id, limit=10)
+        metrics_tracker.end_phase()
+        
+        # Build conversation context
+        conversation_context = ""
+        if history:
+            conversation_context = "\n\nPrevious conversation:\n"
+            for msg in history[-5:]:
+                role = "User" if msg.role == "user" else "Assistant"
+                conversation_context += f"{role}: {msg.content}\n"
+        
+        full_question = request.question
+        if conversation_context:
+            full_question = f"{conversation_context}\nUser: {request.question}"
+        
+        # Get RAG answer
+        metrics_tracker.start_phase("rag_query_execution")
+        result = rag_query(full_question, request.top_k)
+        metrics_tracker.end_phase()
+        
+        if result["success"]:
+            # Prepare sources with metadata
+            sources_data = result.get("sources", [])
+            reflection_data = result.get("reflection", {})
+            
+            # Format streaming response
+            async def stream_response_generator() -> AsyncGenerator[str, None]:
+                # Send metadata first
+                metadata = {
+                    "type": "metadata",
+                    "sources": sources_data,
+                    "confidence": reflection_data.get("confidence", 0.5),
+                    "hallucination_risk": reflection_data.get("hallucination_risk", "unknown"),
+                    "verified": reflection_data.get("verified", False)
+                }
+                yield f"data: {json.dumps(metadata)}\n\n"
+                
+                # Stream answer token by token
+                # Split by sentences for more natural streaming
+                answer = result["answer"]
+                sentences = answer.replace(".", ".\n").replace("!", "!\n").replace("?", "?\n").split("\n")
+                
+                for sentence in sentences:
+                    if sentence.strip():
+                        chunk = {
+                            "type": "token",
+                            "content": sentence.strip(),
+                            "is_complete": False
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        await asyncio.sleep(0.05)  # Small delay for streaming effect
+                
+                # Send completion signal
+                complete = {
+                    "type": "complete",
+                    "total_latency_ms": metrics_tracker.get_total_latency_ms()
+                }
+                yield f"data: {json.dumps(complete)}\n\n"
+            
+            # Log the query
+            doc_sources = [source.get("source", "Unknown") for source in sources_data]
+            _ = metrics_tracker.log_result(
+                retrieved_docs=doc_sources,
+                final_answer=result["answer"],
+                metadata={
+                    "reasoning_method": result.get("reasoning_method", "hybrid"),
+                    "reflection": reflection_data,
+                    "session_id": request.session_id
+                }
+            )
+            
+            # Save to database
+            metrics_tracker.start_phase("database_save")
+            save_message(request.session_id, "user", request.question)
+            save_message(request.session_id, "assistant", result["answer"], json.dumps(sources_data))
+            metrics_tracker.end_phase()
+            
+            return StreamingResponse(
+                stream_response_generator(),
+                media_type="text/event-stream"
+            )
+        else:
+            evaluator.metrics["failed_queries"] += 1
+            error_data = {
+                "type": "error",
+                "message": result["error"]
+            }
+            
+            async def error_generator():
+                yield f"data: {json.dumps(error_data)}\n\n"
+            
+            return StreamingResponse(
+                error_generator(),
+                media_type="text/event-stream",
+                status_code=400
+            )
+    
+    except Exception as e:
+        print(f"Error in streaming query: {e}")
+        import traceback
+        traceback.print_exc()
+        evaluator = get_evaluator()
+        evaluator.metrics["failed_queries"] += 1
+        
+        error_data = {
+            "type": "error",
+            "message": str(e)
+        }
+        
+        async def error_generator():
+            yield f"data: {json.dumps(error_data)}\n\n"
+        
+        return StreamingResponse(
+            error_generator(),
+            media_type="text/event-stream",
+            status_code=500
+        )
 
 
 # Evaluation & Metrics endpoints

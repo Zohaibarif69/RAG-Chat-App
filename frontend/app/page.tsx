@@ -2,11 +2,15 @@
 
 import { useState, useRef, useEffect } from "react";
 import "./globals.css";
+import ChatMessage from "./components/ChatMessage";
+import useStreamingQuery, { StreamMetadata } from "./hooks/useStreamingQuery";
 
 interface Message {
   type: "user" | "assistant";
   content: string;
   sources?: Array<{ source: string; chunk: number; relevance: number }>;
+  metadata?: StreamMetadata;
+  retrievedChunks?: Array<{ source: string; content: string; relevance: number }>;
   created_at?: string;
 }
 
@@ -22,7 +26,9 @@ export default function Home() {
   const [documents, setDocuments] = useState<Array<{ name: string; chunks: number }>>([]);
   const [deletingDoc, setDeletingDoc] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string>("");
+  const [streamingMessageIdx, setStreamingMessageIdx] = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const { query: streamQuery, streaming } = useStreamingQuery();
 
   const API_BASE = "http://127.0.0.1:8000";
 
@@ -315,10 +321,10 @@ export default function Home() {
     }
   };
 
-  // Handle RAG query with conversation context
+  // Handle RAG query with conversation context and streaming
   const handleQuery = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || loading) return;
+    if (!input.trim() || loading || streaming) return;
 
     if (documentCount === 0) {
       setMessages((prev) => [
@@ -337,48 +343,43 @@ export default function Home() {
     setInput("");
     setLoading(true);
 
-    try {
-      const response = await fetch(`${API_BASE}/query`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          question: userMessage, 
-          session_id: sessionId,
-          top_k: 5 
-        }),
+    // Add streaming assistant message placeholder
+    const messageIdx = messages.length + 1;
+    setStreamingMessageIdx(messageIdx);
+    setMessages((prev) => [
+      ...prev,
+      {
+        type: "assistant",
+        content: "",
+        metadata: {
+          sources: [],
+          confidence: 0,
+          hallucination_risk: "low",
+          verified: false,
+        },
+        retrievedChunks: [],
+      },
+    ]);
+
+    await streamQuery(userMessage, sessionId, 5, (response) => {
+      setMessages((prev) => {
+        const updated = [...prev];
+        if (updated[messageIdx]) {
+          updated[messageIdx] = {
+            type: "assistant",
+            content: response.answer,
+            metadata: response.metadata || undefined,
+            retrievedChunks: [],
+          };
+        }
+        return updated;
       });
 
-      const data = await response.json();
-
-      if (data.success) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            type: "assistant",
-            content: data.answer,
-            sources: data.sources,
-          },
-        ]);
-      } else {
-        setMessages((prev) => [
-          ...prev,
-          {
-            type: "assistant",
-            content: ` Error: ${data.error || "Failed to get answer"}`,
-          },
-        ]);
+      if (response.isComplete) {
+        setLoading(false);
+        setStreamingMessageIdx(null);
       }
-    } catch (error) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          type: "assistant",
-          content: ` Error: ${error instanceof Error ? error.message : "Query failed"}`,
-        },
-      ]);
-    } finally {
-      setLoading(false);
-    }
+    });
   };
 
   return (
@@ -513,38 +514,14 @@ export default function Home() {
             </div>
           ) : (
             messages.map((msg, idx) => (
-              <div key={idx} className={`flex ${msg.type === "user" ? "justify-end" : "justify-start"}`}>
-                <div
-                  className={`max-w-md px-4 py-3 rounded-lg ${
-                    msg.type === "user"
-                      ? "bg-blue-600 text-white"
-                      : "bg-gray-100 text-gray-800"
-                  }`}
-                >
-                  <p className="text-sm whitespace-pre-wrap wrap-break-word">{msg.content}</p>
-
-                  {/* Sources */}
-                  {msg.sources && msg.sources.length > 0 && (
-                    <div className="mt-3 pt-3 border-t border-gray-300">
-                      <p className="text-xs font-semibold mb-2 text-gray-600">
-                        Sources:
-                      </p>
-                      <div className="space-y-1">
-                        {msg.sources.map((source, idx) => (
-                          <div key={idx} className="text-xs bg-white p-2 rounded border border-gray-200">
-                            <p className="font-medium text-gray-700">
-                              {source.source} (Chunk {source.chunk})
-                            </p>
-                            <p className="text-gray-500">
-                              Relevance: {(source.relevance * 100).toFixed(1)}%
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
+              <ChatMessage
+                key={idx}
+                type={msg.type}
+                content={msg.content}
+                metadata={msg.metadata}
+                isStreaming={streamingMessageIdx === idx && streaming}
+                retrievedChunks={msg.retrievedChunks || []}
+              />
             ))
           )}
           <div ref={messagesEndRef} />
@@ -567,10 +544,10 @@ export default function Home() {
             />
             <button
               type="submit"
-              disabled={loading || !input.trim() || (documentCount === 0 && documents.length === 0)}
+              disabled={loading || streaming || !input.trim() || (documentCount === 0 && documents.length === 0)}
               className="px-6 py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition"
             >
-              {loading ? "..." : "Send"}
+              {loading || streaming ? "..." : "Send"}
             </button>
           </form>
         </div>
