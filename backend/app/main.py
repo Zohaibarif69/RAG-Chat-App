@@ -7,6 +7,7 @@ import json
 from typing import Optional, List
 from .vector_store import add_documents, rag_query, get_all_documents, delete_document
 from .database import init_db, create_session, get_session, save_message, get_messages, update_session_documents
+from .evaluation import get_evaluator, QueryMetricsTracker
 import uuid
 
 # Load environment variables
@@ -230,13 +231,19 @@ async def upload_pdf(file: UploadFile = File(...)):
         }
 
 
-# RAG Query endpoint with conversation history
+# RAG Query endpoint with conversation history and evaluation
 @app.post("/query", response_model=QueryResponse)
 async def query_rag(request: QueryRequest):
-    """Query RAG system with multi-turn conversation support"""
+    """Query RAG system with multi-turn conversation support and metrics tracking"""
     try:
+        # Initialize evaluation tracking
+        evaluator = get_evaluator()
+        metrics_tracker = QueryMetricsTracker(request.question, evaluator)
+        
         # Get conversation history (last 5 messages)
+        metrics_tracker.start_phase("conversation_history")
         history = get_messages(request.session_id, limit=10)
+        metrics_tracker.end_phase()
         
         # Build conversation context
         conversation_context = ""
@@ -252,12 +259,30 @@ async def query_rag(request: QueryRequest):
             full_question = f"{conversation_context}\nUser: {request.question}"
         
         # Get RAG answer
+        metrics_tracker.start_phase("rag_query_execution")
         result = rag_query(full_question, request.top_k)
+        metrics_tracker.end_phase()
         
         if result["success"]:
-            # Save messages to database
+            # Extract document sources for logging
+            doc_sources = [source.get("source", "Unknown") for source in result.get("sources", [])]
+            
+            # Log the query execution
+            metrics_tracker.start_phase("database_save")
             save_message(request.session_id, "user", request.question)
             save_message(request.session_id, "assistant", result["answer"], json.dumps(result.get("sources", [])))
+            metrics_tracker.end_phase()
+            
+            # Record metrics
+            _ = metrics_tracker.log_result(
+                retrieved_docs=doc_sources,
+                final_answer=result["answer"],
+                metadata={
+                    "reasoning_method": result.get("reasoning_method", "hybrid"),
+                    "reflection": result.get("reflection", {}),
+                    "session_id": request.session_id
+                }
+            )
             
             return QueryResponse(
                 success=True,
@@ -265,6 +290,7 @@ async def query_rag(request: QueryRequest):
                 sources=result["sources"]
             )
         else:
+            evaluator.metrics["failed_queries"] += 1
             return QueryResponse(
                 success=False,
                 error=result["error"]
@@ -274,6 +300,8 @@ async def query_rag(request: QueryRequest):
         print(f"Error in query: {e}")
         import traceback
         traceback.print_exc()
+        evaluator = get_evaluator()
+        evaluator.metrics["failed_queries"] += 1
         return QueryResponse(
             success=False,
             error=str(e)
@@ -305,6 +333,68 @@ def delete_doc(source_name: str):
     try:
         result = delete_document(source_name)
         return result
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+# Evaluation & Metrics endpoints
+@app.get("/metrics")
+def get_metrics():
+    """Get RAG system evaluation metrics"""
+    try:
+        evaluator = get_evaluator()
+        summary = evaluator.get_metrics_summary()
+        return {
+            "success": True,
+            "metrics": summary
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.get("/logs/export")
+def export_logs():
+    """Export all logs to file"""
+    try:
+        evaluator = get_evaluator()
+        filepath = evaluator.save_logs()
+        return {
+            "success": True,
+            "message": f"Logs exported to {filepath}",
+            "filepath": filepath
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.get("/metrics/summary")
+def get_summary():
+    """Get concise metrics summary"""
+    try:
+        evaluator = get_evaluator()
+        summary = evaluator.get_metrics_summary()
+        
+        return {
+            "success": True,
+            "summary": {
+                "total_queries": summary.get("total_queries", 0),
+                "success_rate": f"{summary.get('success_rate', 0):.1%}",
+                "avg_latency_ms": f"{summary.get('avg_latency_ms', 0):.0f}",
+                "avg_cost_usd": f"${summary.get('avg_cost_usd', 0):.4f}",
+                "hallucination_rate": f"{summary.get('hallucination_rate', 0):.1%}",
+                "avg_precision": f"{summary.get('avg_retrieval_precision', 0):.3f}",
+                "avg_recall": f"{summary.get('avg_retrieval_recall', 0):.3f}"
+            }
+        }
     except Exception as e:
         return {
             "success": False,
